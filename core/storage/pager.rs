@@ -2701,12 +2701,14 @@ impl Pager {
     ///
     /// This is a blocking alternative to normal `begin_read_tx`.
     ///
-    /// VACUUM runs on an existing database, so page 1 must already be allocated
-    /// and a WAL must be present.
+    /// VACUUM can be the first operation that needs page 1 after an empty
+    /// auto_vacuum pragma, so allocate page 1 before acquiring the WAL gate.
+    /// A WAL must be present.
     pub fn begin_vacuum_blocking_tx(&self) -> Result<IOResult<()>> {
+        return_if_io!(self.maybe_allocate_page1());
         if !self.db_initialized() {
             return Err(LimboError::InternalError(
-                "begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)".into(),
+                "begin_vacuum_blocking_tx requires an initialized database header".into(),
             ));
         }
         let wal = self.wal.as_ref().ok_or_else(|| {

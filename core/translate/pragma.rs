@@ -13,7 +13,7 @@ use super::integrity_check::{
 };
 use crate::function::Func;
 use crate::pragma::pragma_for;
-use crate::schema::Schema;
+use crate::schema::{Schema, Table};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
@@ -1766,29 +1766,10 @@ fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate
     Ok(())
 }
 
-fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool> {
-    if schema.tables.len() > 1 {
-        return Ok(false);
-    }
-    if let Some(table_arc) = schema.tables.values().next() {
-        let table_name = match table_arc.as_ref() {
-            crate::schema::Table::BTree(tbl) => &tbl.name,
-            crate::schema::Table::Virtual(tbl) => &tbl.name,
-            crate::schema::Table::FromClauseSubquery(tbl) => &tbl.name,
-        };
-
-        if table_name != "sqlite_schema" {
-            return Ok(false);
-        }
-    }
-
-    let db_size_result = pager
-        .io
-        .block(|| pager.with_header(|header| header.database_size.get()));
-
-    match db_size_result {
-        Err(_) => Ok(true),
-        Ok(0 | 1) => Ok(true),
-        Ok(_) => Ok(false),
-    }
+fn is_database_empty(schema: &Schema, _pager: &Arc<Pager>) -> crate::Result<bool> {
+    Ok(schema.tables.values().all(|table| match table.as_ref() {
+        Table::BTree(table) => crate::schema::is_system_table(&table.name),
+        Table::Virtual(table) => table.id() == 0,
+        Table::FromClauseSubquery(_) => false,
+    }))
 }

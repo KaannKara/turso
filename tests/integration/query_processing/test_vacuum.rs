@@ -5107,23 +5107,74 @@ fn test_plain_vacuum_copy_batch_page_count_boundaries() -> anyhow::Result<()> {
 }
 
 /// Truly empty databases exercise the lower edge of the copy-back setup: there
-/// may be no user schema pages to copy, but VACUUM still must leave the file
-/// usable and folded.
+/// may be no user schema pages to copy, but VACUUM still must initialize the
+/// database like SQLite and leave the file usable and folded.
 #[test]
 fn test_plain_vacuum_empty_schema_physical_contract() -> anyhow::Result<()> {
+    let sqlite_dir = TempDir::new()?;
+    let sqlite_path = sqlite_dir.path().join("empty-vacuum-sqlite.db");
+    let sqlite_conn = SqliteConnection::open(sqlite_path)?;
+    sqlite_conn.execute_batch("VACUUM")?;
+    let sqlite_pages = sqlite_scalar_i64(&sqlite_conn, "PRAGMA page_count");
+
     let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
 
-    // A truly empty DB (page 1 never allocated) is not a valid VACUUM target —
-    // an existing database that "looks empty" indicates a problem, not a no-op.
-    let err = conn
-        .execute("VACUUM")
-        .expect_err("VACUUM on an uninitialized database should return an error");
+    conn.execute("VACUUM")?;
     assert_eq!(
-        err.to_string(),
-        "Internal error: begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)",
-        "expected initialization error, got: {err}"
+        scalar_i64(&conn, "PRAGMA page_count"),
+        sqlite_pages,
+        "empty VACUUM should match SQLite's initialized page count"
     );
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'value-1')")?;
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 1);
+
+    Ok(())
+}
+
+#[test]
+fn test_plain_vacuum_after_empty_full_autovacuum_pragma_initializes_ptrmap() -> anyhow::Result<()> {
+    let sqlite_dir = TempDir::new()?;
+    let sqlite_path = sqlite_dir.path().join("empty-full-autovacuum-sqlite.db");
+    let sqlite_conn = SqliteConnection::open(sqlite_path)?;
+    sqlite_conn.execute_batch("PRAGMA auto_vacuum=FULL; VACUUM")?;
+    let sqlite_pages = sqlite_scalar_i64(&sqlite_conn, "PRAGMA page_count");
+
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let tmp_db = TempDatabase::builder()
+        .with_opts(opts)
+        .with_flags(turso_core::OpenFlags::Create)
+        .build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA auto_vacuum=FULL")?;
+    conn.execute("VACUUM")?;
+    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 1);
+    assert_eq!(
+        scalar_i64(&conn, "PRAGMA page_count"),
+        sqlite_pages,
+        "empty auto_vacuum VACUUM should match SQLite's initialized page count"
+    );
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'value-1')")?;
+    assert_eq!(
+        scalar_i64(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'"),
+        3,
+        "FULL auto_vacuum should reserve page 2 for the pointer map"
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
+    let reopened_conn = reopened.connect_limbo();
+    assert_eq!(scalar_i64(&reopened_conn, "PRAGMA auto_vacuum"), 1);
+    assert_eq!(run_integrity_check(&reopened_conn), "ok");
+    assert_eq!(scalar_i64(&reopened_conn, "SELECT COUNT(*) FROM t"), 1);
+
     Ok(())
 }
 
